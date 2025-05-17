@@ -1,0 +1,4 @@
+slack_bolt
+supabase
+openai
+python-dotenv
