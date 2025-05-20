@@ -96,6 +96,34 @@ def handle_opt_in_command_conversational(ack, body, client, logger):
     ack()
     user_id = body["user_id"]
 
+    try:
+        # Check if user already exists in Supabase
+        response = supabase.table("pesto_profiles").select("slack_user_id").eq("slack_user_id", user_id).execute()
+        if response.data:
+            logger.info(f"User {user_id} attempted /opt-in but already exists in Supabase.")
+            client.chat_postMessage(
+                channel=user_id,
+                text="You've already opted into Pesto! If you'd like to update your profile, please use the `/re-opt-in` command."
+            )
+            # Also send a confirmation to the channel where the command was invoked, if it's a public channel
+            # This is good practice so the user knows the bot responded, even if it's just to say "check DMs" or "already in"
+            if body.get("channel_id") != user_id: # i.e. not a DM with the bot already
+                 client.chat_postMessage(
+                    channel=body["channel_id"],
+                    text=f"<@{user_id}>, you're already opted in! I've sent you a DM with more details."
+                )
+            return
+    except Exception as e:
+        logger.error(f"Error checking Supabase for existing user {user_id} during /opt-in: {e}", exc_info=True)
+        try:
+            client.chat_postMessage(
+                channel=user_id,
+                text="Sorry, I couldn't check your current status. Please try again in a moment."
+            )
+        except Exception as slack_e:
+            logger.error(f"Failed to send error DM to user {user_id}: {slack_e}")
+        return
+
     if user_id in active_opt_ins and active_opt_ins[user_id]["current_question_index"] < len(OPT_IN_QUESTIONS):
         try:
             current_session_thread_ts = active_opt_ins[user_id].get("thread_ts")
@@ -127,6 +155,53 @@ def handle_opt_in_command_conversational(ack, body, client, logger):
             ask_question(user_id, client) # Ask the first question (will not be threaded yet)
         except Exception as e:
             logger.error(f"Error starting opt-in conversation with user {user_id}: {e}")
+
+# --- /re-opt-in Command Handler ---
+@app.command("/re-opt-in")
+def handle_re_opt_in_command(ack, body, client, logger):
+    """Handles the /re-opt-in slash command to allow users to update their profile."""
+    ack()
+    user_id = body["user_id"]
+    logger.info(f"User {user_id} initiated /re-opt-in.")
+
+    # Clear any existing session for this user, if one somehow exists, to ensure a fresh start
+    if user_id in active_opt_ins:
+        logger.info(f"Clearing pre-existing active_opt_ins session for user {user_id} before /re-opt-in.")
+        del active_opt_ins[user_id]
+
+    # Start a new opt-in session
+    active_opt_ins[user_id] = {
+        "current_question_index": 0,
+        "answers": {},
+        "thread_ts": None # Initialize thread_ts for the new session
+    }
+    logger.info(f"Initialized new opt-in session for user {user_id} via /re-opt-in.")
+
+    try:
+        # Notify in the channel where command was invoked (if not a DM)
+        if body.get("channel_id") != user_id: # i.e. not a DM with the bot already
+            client.chat_postMessage(
+                channel=body["channel_id"],
+                text=f"<@{user_id}>, I\'ll send you a DM to update your Pesto profile! Please check your DMs."
+            )
+        
+        # Send initial DM
+        client.chat_postMessage(
+            channel=user_id,
+            text="Hi there! You've requested to update your Pesto profile. Let\'s go through the questions again."
+            # First message in DM is not threaded
+        )
+        ask_question(user_id, client) # Ask the first question
+        logger.info(f"Started re-opt-in question flow for user {user_id}.")
+    except Exception as e:
+        logger.error(f"Error starting re-opt-in conversation with user {user_id}: {e}", exc_info=True)
+        try:
+            client.chat_postMessage(
+                channel=user_id,
+                text="Sorry, I couldn\'t start the profile update process. Please try again in a moment."
+            )
+        except Exception as slack_e:
+            logger.error(f"Failed to send error DM to user {user_id} during re-opt-in setup: {slack_e}")
 
 # --- Message Event Handler ---
 @app.event("message")
@@ -244,38 +319,70 @@ def handle_find_command(ack, command, client, logger, respond):
     """Handles the /find slash command to search for relevant profiles."""
     ack()
     
-    query_text = command.get("text", "").strip()
+    original_query_text = command.get("text", "").strip()
     querier_user_id = command["user_id"]
-    # respond is available for slash commands to send ephemeral or in_channel messages
 
-    if not query_text:
+    if not original_query_text:
         respond(
             text="Please provide a query to search for. Usage: `/find <your query>`",
-            response_type="ephemeral" # Only visible to the user who typed the command
-        )
-        return
-
-    logger.info(f"User {querier_user_id} initiated /find with query: '{query_text}'")
-
-    # 1. Generate embedding for the query text
-    query_embedding = get_embedding(query_text)
-
-    if query_embedding is None:
-        logger.error(f"Failed to generate embedding for query: '{query_text}'")
-        respond(
-            text="Sorry, I couldn't process your query to generate an embedding. Please try again.",
             response_type="ephemeral"
         )
         return
-    
-    logger.info(f"Successfully generated embedding for query: '{query_text}'")
 
-    # 2. Call Supabase RPC function to find matching profiles
-    match_threshold = 0.7  # Adjust as needed (0.0 to 1.0)
-    match_count = 3       # Number of top matches to return
+    logger.info(f"User {querier_user_id} initiated /find with original query: '{original_query_text}'")
 
+    openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+
+    # 1. Extract keywords using an LLM
+    extracted_keywords_or_phrase = "" 
     try:
-        logger.info(f"Calling RPC match_pesto_profiles with threshold: {match_threshold}, count: {match_count}")
+        # Option 2.1: More explicit instructions and few-shot examples
+        keyword_extraction_system_prompt = """You are an expert at extracting key entities and concepts from a user's query for finding matching professional profiles. Your goal is to distill the query into its most essential components: core skills, technologies, job functions, industries, or primary professional interests.
+Instructions:
+1. Identify the core subjects or entities the user is looking for.
+2. Remove stop words, articles, and conversational filler (e.g., 'find me a', 'looking for', 'who is', 'working on').
+3. Do NOT include generic nouns like 'person', 'individual', 'someone' if more specific professional descriptors or concepts are present or implied. For example, 'business person' should be refined to 'business' or 'business professional'.
+4. Return a concise, comma-separated list of these core keywords or a very short descriptive phrase.
+Example Query: 'find me a business person working on Robotic'
+Example Output: 'business, Robotic'
+Example Query: 'someone skilled in python and data analysis'
+Example Output: 'Python, data analysis'"""
+        
+        prompt_messages_keyword_extraction = [
+            {"role": "system", "content": keyword_extraction_system_prompt},
+            {"role": "user", "content": f"User query: {original_query_text}"}
+        ]
+        
+        logger.info(f"Sending query to LLM for keyword/search phrase extraction (Prompt v2.1): {original_query_text}")
+        chat_completion_response = openai_client.chat.completions.create(
+            model="gpt-4o-mini", # Updated model
+            messages=prompt_messages_keyword_extraction,
+            temperature=0.1 # Very low temperature for more precise adherence to examples
+        )
+        text_to_embed = chat_completion_response.choices[0].message.content.strip()
+        logger.info(f"LLM extracted keywords/search phrase (v2.1): '{text_to_embed}' from original query: '{original_query_text}'")
+
+        if not text_to_embed:
+            logger.warning(f"LLM (v2.1) did not return keywords/search phrase for query: '{original_query_text}'. Using original query for embedding.")
+            text_to_embed = original_query_text
+
+    except Exception as e:
+        logger.error(f"Error calling LLM (v2.1) for keyword/search phrase extraction for query '{original_query_text}': {e}", exc_info=True)
+        respond(text="Sorry, I had trouble refining your query. Please try again.", response_type="ephemeral")
+        return
+
+    # 2. Generate embedding
+    query_embedding = get_embedding(text_to_embed)
+    if query_embedding is None:
+        logger.error(f"Failed to generate embedding for text: '{text_to_embed}'")
+        respond(text="Sorry, I couldn't process your query for embedding. Please try again.", response_type="ephemeral")
+        return
+    logger.info(f"Successfully generated embedding for text: '{text_to_embed}'")
+
+    # 3. Call Supabase RPC
+    match_threshold = 0.7  
+    match_count = 3 
+    try:
         rpc_response = supabase.rpc(
             "match_pesto_profiles",
             {
@@ -288,52 +395,93 @@ def handle_find_command(ack, command, client, logger, respond):
 
         if rpc_response.data:
             matched_profiles = rpc_response.data
-            logger.info(f"Found {len(matched_profiles)} matching profiles for query '{query_text}'.")
+            logger.info(f"Found {len(matched_profiles)} matching profiles for refined query text '{text_to_embed}' (original: '{original_query_text}').")
             
-            # 3. Format and send the results
-            blocks = [
+            # 4. Generate explanations for all matches in a single LLM call
+            all_explanations = ["Could not generate explanation for this match." for _ in matched_profiles]
+            if matched_profiles: # Only call LLM if there are profiles to explain
+                profile_summaries_for_llm = []
+                for i, profile in enumerate(matched_profiles):
+                    parts = [
+                        f"Profile {i+1}:",
+                        f"Name: {profile.get('full_name', 'N/A')}",
+                        f"Skills: {profile.get('skillset', 'N/A')}",
+                        f"Background: {profile.get('background_summary', 'N/A')}",
+                        f"Interests: {profile.get('topics_of_interest', 'N/A')}",
+                        f"Industry: {profile.get('industry', 'N/A')}"
+                    ]
+                    profile_summaries_for_llm.append(" ".join(parts))
+                
+                combined_profile_text = "\n\n".join(profile_summaries_for_llm)
+
+                explanation_prompt_messages = [
+                    {"role": "system", "content": f"You are an expert at explaining why professional profiles are good matches for a user's query. For each profile provided below, write a concise 1-2 sentence explanation. Start each explanation with 'Profile X is a good match because...' or similar, ensuring each explanation is clearly for the corresponding profile number. Output each explanation on a new line, numbered. Example: 1. Explanation for profile 1. 2. Explanation for profile 2."},
+                    {"role": "user", "content": f"User query: \"{original_query_text}\".\n\nMatched profiles:\n{combined_profile_text}\n\nProvide a numbered list of explanations, one for each profile, explaining why it matches the user query."}
+                ]
+                try:
+                    logger.info(f"Generating explanations for {len(matched_profiles)} profiles based on query '{original_query_text}'")
+                    explanation_response = openai_client.chat.completions.create(
+                        model="gpt-4o-mini", # Updated model
+                        messages=explanation_prompt_messages,
+                        temperature=0.3
+                    )
+                    raw_explanations_text = explanation_response.choices[0].message.content.strip()
+                    logger.info(f"LLM raw explanations: '{raw_explanations_text}'")
+                    
+                    # Attempt to parse numbered list of explanations
+                    parsed_explanations = []
+                    for line in raw_explanations_text.split('\n'):
+                        line = line.strip()
+                        if line and (line[0].isdigit() and (line[1] == '.' or line[1:3] == '. ')):
+                            parsed_explanations.append(line.split('.', 1)[1].strip() if '.' in line else line.split(' ',1)[1].strip() ) 
+                    
+                    if len(parsed_explanations) == len(matched_profiles):
+                        all_explanations = parsed_explanations
+                    else:
+                        logger.warning(f"Could not parse explanations correctly. Expected {len(matched_profiles)}, got {len(parsed_explanations)}. Using default.")
+                        # Fallback: we could try to assign first N explanations if count is off, or just use default.
+
+                except Exception as e:
+                    logger.error(f"Error generating LLM explanations for profiles: {e}", exc_info=True)
+            
+            # 5. Format and send the results
+            response_blocks = [
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"Here are some profiles that might match your query: *\"{query_text}\"*"
+                        "text": f"Based on your query *\"{original_query_text}\"* (refined to: *\"{text_to_embed}\"*), here are some profiles that might match:"
                     }
                 },
                 {"type": "divider"}
             ]
 
-            for profile in matched_profiles:
-                profile_info = f"*<@{profile['slack_user_id']}>* ({profile.get('full_name', 'N/A')})\n"
-                if profile.get('linkedin_url'):
-                    profile_info += f"LinkedIn: <{profile['linkedin_url']}|View Profile>\n"
-                if profile.get('skillset'):
-                    profile_info += f"Skills: _{profile['skillset']}_\n"
-                if profile.get('topics_of_interest'):
-                    profile_info += f"Interests: _{profile['topics_of_interest']}_\n"
-                # Add more fields if desired, e.g., background_summary, current_projects
-                profile_info += f"Similarity: {profile['similarity']:.2f}\n"
+            for i, profile in enumerate(matched_profiles):
+                explanation = all_explanations[i]
+                profile_info_blocks = [
+                    f"*<@{profile['slack_user_id']}>* ({profile.get('full_name', 'N/A')})",
+                    f"*Reason for match:* {explanation}",
+                    f"Similarity Score: {profile['similarity']:.2f}"
+                ]
+                if profile.get('linkedin_url'): profile_info_blocks.append(f"LinkedIn: <{profile['linkedin_url']}|View Profile>")
+                if profile.get('skillset'): profile_info_blocks.append(f"Skills: _{profile['skillset']}_")
+                if profile.get('topics_of_interest'): profile_info_blocks.append(f"Interests: _{profile['topics_of_interest']}_")
                 
-                blocks.append({
+                response_blocks.append({
                     "type": "section",
-                    "text": {"type": "mrkdwn", "text": profile_info}
+                    "text": {"type": "mrkdwn", "text": "\n".join(profile_info_blocks)}
                 })
-                blocks.append({"type": "divider"})
+                response_blocks.append({"type": "divider"})
             
-            respond(blocks=blocks, response_type="ephemeral") # Or "in_channel"
+            respond(blocks=response_blocks, response_type="ephemeral")
 
         else:
-            logger.info(f"No matching profiles found for query: '{query_text}'")
-            respond(
-                text=f"Sorry, I couldn't find any profiles matching your query: '{query_text}'",
-                response_type="ephemeral"
-            )
+            logger.info(f"No matching profiles found for refined query text: '{text_to_embed}' (original: '{original_query_text}').")
+            respond(text=f"Sorry, I couldn't find any profiles matching your query: '{original_query_text}' (refined to: '{text_to_embed}').", response_type="ephemeral")
 
     except Exception as e:
-        logger.error(f"Error calling Supabase RPC or processing /find for query '{query_text}': {e}", exc_info=True)
-        respond(
-            text="Sorry, something went wrong while searching for profiles. Please try again later.",
-            response_type="ephemeral"
-        )
+        logger.error(f"Error calling Supabase RPC or processing /find for refined query '{text_to_embed}': {e}", exc_info=True)
+        respond(text="Sorry, something went wrong while searching for profiles. Please try again later.", response_type="ephemeral")
 
 if __name__ == "__main__":
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
