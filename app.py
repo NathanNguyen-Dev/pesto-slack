@@ -36,6 +36,19 @@ OPT_IN_QUESTIONS = [
     {"id": "networking_goals", "prompt": "And finally, what is your top networking goal? (e.g., finding a mentor, an expert, a co-founder)", "column": "networking_goals"}
 ]
 
+# --- In-memory store for active opt-in-v2 sessions ---
+active_opt_ins_v2 = {}  # Stores user_id: {"current_question_index": 0, "answers": {}, "thread_ts": None}
+
+# --- Define Opt-in-v2 Questions ---
+OPT_IN_V2_QUESTIONS = [
+    {"id": "linkedin_url", "prompt": "Please share your LinkedIn profile URL (e.g., https://linkedin.com/in/yourprofile).", "column": "linkedin_url"},
+    {"id": "connect_with", "prompt": "Who do you want to connect with? (e.g., founders, engineers, investors, etc.)", "column": "connect_with"},
+    {"id": "current_work", "prompt": "What are you currently working on?", "column": "current_work"}
+]
+
+# --- In-memory store for users who have recently reset their opt-in ---
+recently_reset_opt_in = {}
+
 # --- Embedding Helper Function (Updated for openai >= 1.0.0) ---
 def get_embedding(text: str, model="text-embedding-ada-002") -> list[float]:
     """Generates an embedding for the given text using OpenAI."""
@@ -89,30 +102,68 @@ def ask_question(user_id, client):
         except Exception as e:
             logger.error(f"Error sending completion message from ask_question to user {user_id}: {e}")
 
+# --- Helper function to ask a question for v2 ---
+def ask_question_v2(user_id, client):
+    session = active_opt_ins_v2.get(user_id)
+    if not session:
+        return
+    question_index = session["current_question_index"]
+    thread_ts_to_use = session.get("thread_ts")
+    if question_index < len(OPT_IN_V2_QUESTIONS):
+        question_data = OPT_IN_V2_QUESTIONS[question_index]
+        try:
+            payload = {
+                "channel": user_id,
+                "text": question_data["prompt"]
+            }
+            if thread_ts_to_use:
+                payload["thread_ts"] = thread_ts_to_use
+            client.chat_postMessage(**payload)
+            logger.info(f"[V2] Asked question {question_index} to user {user_id} (thread_ts: {thread_ts_to_use})")
+        except Exception as e:
+            logger.error(f"[V2] Error sending question to user {user_id}: {e}")
+    else:
+        try:
+            payload = {
+                "channel": user_id,
+                "text": "Thanks! I have all your answers. Processing your profile..."
+            }
+            if thread_ts_to_use:
+                payload["thread_ts"] = thread_ts_to_use
+            client.chat_postMessage(**payload)
+        except Exception as e:
+            logger.error(f"[V2] Error sending completion message to user {user_id}: {e}")
+
 # --- /opt-in Command Handler (Conversational) ---
 @app.command("/opt-in")
 def handle_opt_in_command_conversational(ack, body, client, logger):
     """Handles the /opt-in slash command and starts the conversational opt-in flow."""
     ack()
     user_id = body["user_id"]
-
     try:
         # Check if user already exists in Supabase
         response = supabase.table("pesto_profiles").select("slack_user_id").eq("slack_user_id", user_id).execute()
         if response.data:
-            logger.info(f"User {user_id} attempted /opt-in but already exists in Supabase.")
-            client.chat_postMessage(
-                channel=user_id,
-                text="You've already opted into Pesto! If you'd like to update your profile, please use the `/re-opt-in` command."
-            )
-            # Also send a confirmation to the channel where the command was invoked, if it's a public channel
-            # This is good practice so the user knows the bot responded, even if it's just to say "check DMs" or "already in"
-            if body.get("channel_id") != user_id: # i.e. not a DM with the bot already
-                 client.chat_postMessage(
-                    channel=body["channel_id"],
-                    text=f"<@{user_id}>, you're already opted in! I've sent you a DM with more details."
+            # If user has recently reset, delete their profile and allow re-opt-in
+            if recently_reset_opt_in.get(user_id):
+                try:
+                    supabase.table("pesto_profiles").delete().eq("slack_user_id", user_id).execute()
+                    logger.info(f"Deleted existing profile for user {user_id} after reset, allowing re-opt-in.")
+                    del recently_reset_opt_in[user_id]
+                except Exception as e:
+                    logger.error(f"Error deleting profile for user {user_id} after reset: {e}")
+            else:
+                logger.info(f"User {user_id} attempted /opt-in but already exists in Supabase.")
+                client.chat_postMessage(
+                    channel=user_id,
+                    text="You've already opted into Pesto! If you'd like to update your profile, please use the `/re-opt-in` command."
                 )
-            return
+                if body.get("channel_id") != user_id:
+                    client.chat_postMessage(
+                        channel=body["channel_id"],
+                        text=f"<@{user_id}>, you're already opted in! I've sent you a DM with more details."
+                    )
+                return
     except Exception as e:
         logger.error(f"Error checking Supabase for existing user {user_id} during /opt-in: {e}", exc_info=True)
         try:
@@ -159,51 +210,87 @@ def handle_opt_in_command_conversational(ack, body, client, logger):
 # --- /re-opt-in Command Handler ---
 @app.command("/re-opt-in")
 def handle_re_opt_in_command(ack, body, client, logger):
-    """Handles the /re-opt-in slash command to allow users to update their profile."""
+    """Handles the /re-opt-in slash command to reset the user's opt-in session state only."""
     ack()
     user_id = body["user_id"]
-    logger.info(f"User {user_id} initiated /re-opt-in.")
+    logger.info(f"User {user_id} initiated /re-opt-in (reset only).")
 
-    # Clear any existing session for this user, if one somehow exists, to ensure a fresh start
+    # Clear any existing session for this user, if one exists
     if user_id in active_opt_ins:
-        logger.info(f"Clearing pre-existing active_opt_ins session for user {user_id} before /re-opt-in.")
+        logger.info(f"Clearing pre-existing active_opt_ins session for user {user_id} via /re-opt-in.")
         del active_opt_ins[user_id]
-
-    # Start a new opt-in session
-    active_opt_ins[user_id] = {
-        "current_question_index": 0,
-        "answers": {},
-        "thread_ts": None # Initialize thread_ts for the new session
-    }
-    logger.info(f"Initialized new opt-in session for user {user_id} via /re-opt-in.")
-
+    if user_id in active_opt_ins_v2:
+        logger.info(f"Clearing pre-existing active_opt_ins_v2 session for user {user_id} via /re-opt-in.")
+        del active_opt_ins_v2[user_id]
+    # Mark user as recently reset
+    recently_reset_opt_in[user_id] = True
+    # Notify the user in the channel where command was invoked
     try:
-        # Notify in the channel where command was invoked (if not a DM)
-        if body.get("channel_id") != user_id: # i.e. not a DM with the bot already
-            client.chat_postMessage(
-                channel=body["channel_id"],
-                text=f"<@{user_id}>, I\'ll send you a DM to update your Pesto profile! Please check your DMs."
-            )
-        
-        # Send initial DM
         client.chat_postMessage(
-            channel=user_id,
-            text="Hi there! You've requested to update your Pesto profile. Let\'s go through the questions again."
-            # First message in DM is not threaded
+            channel=body["channel_id"],
+            text=f"<@{user_id}>, your opt-in session has been reset. You can now run /opt-in or /opt-in-v2 to start over."
         )
-        ask_question(user_id, client) # Ask the first question
-        logger.info(f"Started re-opt-in question flow for user {user_id}.")
     except Exception as e:
-        logger.error(f"Error starting re-opt-in conversation with user {user_id}: {e}", exc_info=True)
+        logger.error(f"Error sending reset confirmation for /re-opt-in to user {user_id}: {e}")
+
+# --- /opt-in-v2 Command Handler ---
+@app.command("/opt-in-v2")
+def handle_opt_in_v2_command(ack, body, client, logger):
+    """Handles the /opt-in-v2 slash command and starts the 3-question opt-in flow."""
+    ack()
+    user_id = body["user_id"]
+    try:
+        response = supabase.table("pesto_profiles").select("slack_user_id").eq("slack_user_id", user_id).execute()
+        if response.data:
+            if recently_reset_opt_in.get(user_id):
+                try:
+                    supabase.table("pesto_profiles").delete().eq("slack_user_id", user_id).execute()
+                    logger.info(f"[V2] Deleted existing profile for user {user_id} after reset, allowing re-opt-in-v2.")
+                    del recently_reset_opt_in[user_id]
+                except Exception as e:
+                    logger.error(f"[V2] Error deleting profile for user {user_id} after reset: {e}")
+            else:
+                logger.info(f"[V2] User {user_id} attempted /opt-in-v2 but already exists in Supabase.")
+                client.chat_postMessage(
+                    channel=user_id,
+                    text="You've already opted into Pesto! If you'd like to update your profile, please use the `/re-opt-in` command."
+                )
+                if body.get("channel_id") != user_id:
+                    client.chat_postMessage(
+                        channel=body["channel_id"],
+                        text=f"<@{user_id}>, you're already opted in! I've sent you a DM with more details."
+                    )
+                return
+    except Exception as e:
+        logger.error(f"[V2] Error checking Supabase for existing user {user_id} during /opt-in-v2: {e}", exc_info=True)
         try:
             client.chat_postMessage(
                 channel=user_id,
-                text="Sorry, I couldn\'t start the profile update process. Please try again in a moment."
+                text="Sorry, I couldn't check your current status. Please try again in a moment."
             )
         except Exception as slack_e:
-            logger.error(f"Failed to send error DM to user {user_id} during re-opt-in setup: {slack_e}")
+            logger.error(f"[V2] Failed to send error DM to user {user_id}: {slack_e}")
+        return
+    # Start a new session
+    active_opt_ins_v2[user_id] = {
+        "current_question_index": 0,
+        "answers": {},
+        "thread_ts": None
+    }
+    try:
+        client.chat_postMessage(
+            channel=body["channel_id"],
+            text=f"<@{user_id}>, I'll send you a DM to start setting up your Pesto profile (v2)! Please check your DMs."
+        )
+        client.chat_postMessage(
+            channel=user_id,
+            text="Hi there! Thanks for your interest in Pesto (v2). I'll ask you 3 quick questions to set up your profile. You can reply to me directly here."
+        )
+        ask_question_v2(user_id, client)
+    except Exception as e:
+        logger.error(f"[V2] Error starting opt-in-v2 conversation with user {user_id}: {e}")
 
-# --- Message Event Handler ---
+# --- Message Event Handler (handles both v1 and v2 opt-in flows) ---
 @app.event("message")
 def handle_message_events(event, client, logger):
     logger.info(f"--- Message Event Received ---")
@@ -221,6 +308,46 @@ def handle_message_events(event, client, logger):
 
     user_id = event.get("user")
     logger.info(f"Message from user_id: {user_id}")
+
+    # --- v2 session check ---
+    if user_id in active_opt_ins_v2:
+        session = active_opt_ins_v2[user_id]
+        question_index = session["current_question_index"]
+        session["thread_ts"] = event.get("thread_ts")
+        thread_ts_to_use = session.get("thread_ts")
+        if question_index < len(OPT_IN_V2_QUESTIONS):
+            answer = event.get("text", "").strip()
+            question_data = OPT_IN_V2_QUESTIONS[question_index]
+            session["answers"][question_data["id"]] = answer
+            session["current_question_index"] += 1
+            if session["current_question_index"] < len(OPT_IN_V2_QUESTIONS):
+                ask_question_v2(user_id, client)
+            else:
+                try:
+                    payload_processing = {"channel": user_id, "text": "Great, that's all the questions! Let me process your profile..."}
+                    if thread_ts_to_use: payload_processing["thread_ts"] = thread_ts_to_use
+                    client.chat_postMessage(**payload_processing)
+                    # profile_data = session["answers"]
+                    # --- SKIP DB INSERT FOR V2 ---
+                    payload_success = {"channel": user_id, "text": "Thanks for opting into Pesto (v2)! Your profile has been successfully set up (not saved to DB yet)."}
+                    if thread_ts_to_use: payload_success["thread_ts"] = thread_ts_to_use
+                    client.chat_postMessage(**payload_success)
+                except Exception as e:
+                    logger.error(f"[V2] Error finalizing profile for user {user_id}: {e}", exc_info=True)
+                    try:
+                        payload_error = {"channel": user_id, "text": "Sorry, there was an error setting up your Pesto (v2) profile. Please try again or use /opt-in-v2 to restart."}
+                        if thread_ts_to_use: payload_error["thread_ts"] = thread_ts_to_use
+                        client.chat_postMessage(**payload_error)
+                    except Exception as slack_e:
+                        logger.error(f"[V2] Failed to send error DM to user {user_id}: {slack_e}", exc_info=True)
+                finally:
+                    if user_id in active_opt_ins_v2:
+                        del active_opt_ins_v2[user_id]
+        else:
+            logger.warning(f"[V2] User {user_id} sent a message, but their question_index ({question_index}) indicates they might have already completed the v2 flow. Ignoring.")
+        return
+
+    # --- v1 session check ---
     if user_id not in active_opt_ins:
         logger.warning(f"User {user_id} sent a DM, but is not in an active opt-in session. Current sessions: {list(active_opt_ins.keys())}")
         return
@@ -233,8 +360,7 @@ def handle_message_events(event, client, logger):
     # Update session's thread_ts based on the incoming message's thread context
     session["thread_ts"] = event.get("thread_ts") 
     logger.info(f"Updated session thread_ts for user {user_id} to: {session['thread_ts']}")
-    
-    thread_ts_to_use = session.get("thread_ts") # Use this for replies in this handler
+    thread_ts_to_use = session.get("thread_ts")
 
     if question_index < len(OPT_IN_QUESTIONS):
         answer = event.get("text", "").strip()
@@ -254,7 +380,6 @@ def handle_message_events(event, client, logger):
                 payload_processing = {"channel": user_id, "text": "Great, that's all the questions! Let me process your profile..."}
                 if thread_ts_to_use: payload_processing["thread_ts"] = thread_ts_to_use
                 client.chat_postMessage(**payload_processing)
-                
                 profile_data = session["answers"]
                 logger.info(f"Collected answers for {user_id}: {profile_data}")
 
@@ -269,7 +394,6 @@ def handle_message_events(event, client, logger):
                 ]
                 text_for_embedding = ". ".join(filter(None, text_for_embedding_parts))
                 logger.info(f"Text for embedding for {user_id}: '{text_for_embedding[:200]}...'") # Log snippet
-                
                 embedding_vector = None
                 if text_for_embedding.strip():
                     embedding_vector = get_embedding(text_for_embedding)
@@ -279,10 +403,8 @@ def handle_message_events(event, client, logger):
                         logger.error(f"Failed to generate embedding for {user_id} despite having text.")
                 else:
                     logger.warning(f"User {user_id} profile has no text content for embedding. Embedding will be null.")
-
                 if embedding_vector is None and text_for_embedding.strip():
                     client.chat_postMessage(channel=user_id, text="Sorry, there was an issue generating insights from your profile. Your text answers have been saved, but you might need to re-opt-in or contact support if search doesn't work as expected.")
-                
                 data_to_upsert = {
                     "slack_user_id": user_id,
                     **profile_data,
@@ -291,12 +413,10 @@ def handle_message_events(event, client, logger):
                 }
                 logger.info(f"Attempting to upsert data to Supabase for {user_id}.")
                 supabase.table("pesto_profiles").upsert(data_to_upsert).execute()
-                
                 payload_success = {"channel": user_id, "text": "Thanks for opting into Pesto! Your profile has been successfully set up."}
                 if thread_ts_to_use: payload_success["thread_ts"] = thread_ts_to_use
                 client.chat_postMessage(**payload_success)
                 logger.info(f"Successfully saved profile for user {user_id} to Supabase.")
-
             except Exception as e:
                 logger.error(f"Error finalizing profile for user {user_id}: {e}", exc_info=True)
                 try:
